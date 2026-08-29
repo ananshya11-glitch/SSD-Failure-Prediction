@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Large dataset files
+data/raw/
+data/processed/
+
+# Generated results
+results/
+
+# Jupyter
+.ipynb_checkpoints/
