@@ -68,10 +68,14 @@ class Config:
     kendall_outlier_z: float = 2.0
 
     # -- Synthetic fixtures -------------------------------------
-    synth_n_drives: int = 300
+    # Calibrated to reports/vendor_profile.csv. Per-model failure rates
+    # live in data/synthetic.py; failure_scale multiplies them so small
+    # fixtures carry enough positives while preserving the real A<B<C
+    # ordering. censor_rate matches the real 133,804/475,056 = 28%.
+    synth_n_drives: int = 400
     synth_days: int = 180
-    synth_failure_rate: float = 0.15
-    synth_censor_rate: float = 0.10
+    synth_failure_scale: float = 4.0
+    synth_censor_rate: float = 0.28
     synth_seed: int = 42
 
     # -- LOMO ---------------------------------------------------

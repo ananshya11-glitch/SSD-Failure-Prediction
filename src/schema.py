@@ -73,6 +73,39 @@ VENDOR_SMART_IDS = {
 }
 
 
+# ---------------------------------------------------------------
+# Common feature set — the LOMO-usable intersection
+#
+# Only 8 SMART IDs (16 columns) are populated by all three vendors.
+# Under LOMO this is the only feature set available in every fold:
+# columns exclusive to the training vendors are all-NaN at test time,
+# and columns exclusive to the held-out vendor were never trained on.
+#
+# LOCKED DECISION: common-16 is the primary feature policy. A
+# union-plus-imputation variant may be run as an ablation, but
+# imputation must not confound the headline coverage result.
+# ---------------------------------------------------------------
+
+COMMON_IDS = sorted(
+    set(VENDOR_SMART_IDS["A"])
+    & set(VENDOR_SMART_IDS["B"])
+    & set(VENDOR_SMART_IDS["C"])
+)
+
+COMMON_COLS = [c for i in COMMON_IDS for c in (f"n_{i}", f"r_{i}")]
+
+assert len(COMMON_COLS) == 16, (
+    f"expected 16 common columns, got {len(COMMON_COLS)}. "
+    "If this changed, re-derive from reports/attribute_availability.csv "
+    "and revisit the feature policy."
+)
+
+
+def common_cols() -> list[str]:
+    """The 16 columns usable in every LOMO fold."""
+    return list(COMMON_COLS)
+
+
 def vendor_cols(vendor: str) -> list[str]:
     """SMART columns a vendor populates. Others are NaN throughout."""
     ids = VENDOR_SMART_IDS[vendor]

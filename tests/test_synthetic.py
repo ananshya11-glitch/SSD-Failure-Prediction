@@ -13,7 +13,8 @@ import polars as pl
 import pytest
 
 from src.config import CFG, DRIVE_MODELS
-from src.schema import ALL_COLS, SMART_COLS, vendor_cols
+from src.schema import (ALL_COLS, COMMON_COLS, COMMON_IDS, SMART_COLS,
+                        vendor_cols)
 from src.data.synthetic import make_synthetic
 
 
@@ -139,18 +140,47 @@ def test_horizon_label_window_size(fixture):
     assert counts["len"].max() == h
 
 
-def test_no_rows_after_failure(fixture):
-    df, _ = fixture
-    assert df.filter(pl.col("days_to_failure") < 0).height == 0
+def test_post_failure_rows_exist(fixture):
+    """
+    The real fleet has ~78 post-failure rows per failed drive: drives
+    keep reporting after the recorded failure_time. labels.py must drop
+    these, so the fixture has to contain them.
+    """
+    df, truth = fixture
+    post = df.filter(pl.col("days_to_failure") < 0)
+    assert post.height > 0
+    per_drive = post.group_by(["model", "disk_id"]).len()
+    assert per_drive.height == truth["n_failed"]
+    assert per_drive["len"].max() <= truth["post_failure_days"]
+
+
+def test_row_exists_at_exactly_zero_days_to_failure(fixture):
+    """
+    Exercises the strict inequality in the label rule: the failure day
+    itself has days_to_failure == 0 and must NOT be a positive under
+    0 < dtf <= horizon.
+    """
+    df, truth = fixture
+    zero = df.filter(pl.col("days_to_failure") == 0)
+    assert zero.height == truth["n_failed"]
 
 
 def test_failure_event_is_not_the_target(fixture):
     """
-    failure_event is a 'has already failed' flag: one row per failed
-    drive. Guards against anyone training on it by mistake.
+    failure_event = (days_to_failure <= 0) is a 'has already failed'
+    flag covering the failure day and every post-failure row. It is not
+    the 30-day target and must never be used as one.
     """
     df, truth = fixture
-    assert int(df["failure_event"].sum()) == truth["n_failed"]
+    n_event = int(df["failure_event"].sum())
+    expected = truth["n_failed"] * (1 + truth["post_failure_days"])
+    assert n_event == expected
+
+    horizon_positives = df.filter(
+        (pl.col("days_to_failure") > 0)
+        & (pl.col("days_to_failure") <= truth["horizon_days"])
+    ).height
+    assert n_event != horizon_positives
 
 
 def test_healthy_drives_have_null_failure_time(fixture):
@@ -258,16 +288,87 @@ def test_small_fixture_is_usable():
     assert set(df["model"].unique()) == set(DRIVE_MODELS)
 
 
-def test_vendor_c_is_thin(fixture):
+def test_vendor_proportions_match_real_fleet(fixture):
     """
-    Vendor C is deliberately under-represented so thin-fold handling is
-    exercised on every run, mirroring the real LOMO viability risk.
+    Real profile: A 33.3%, B 19.6%, C 47.0% of drives. C is the LARGEST
+    vendor and B the smallest — the opposite of the pre-profiling guess.
+    """
+    _, truth = fixture
+    d = truth["drives_by_vendor"]
+    total = sum(d.values())
+    share = {v: d[v] / total for v in d}
+
+    assert d["C"] > d["A"] > d["B"]
+    for v, expected in [("A", 0.333), ("B", 0.196), ("C", 0.470)]:
+        assert abs(share[v] - expected) < 0.03, (v, share[v])
+
+
+def test_label_shift_across_vendors(fixture):
+    """
+    Failure rates differ 3.7x across vendors in the real fleet
+    (A 1.42%, B 2.59%, C 5.21%). LOMO therefore breaks exchangeability
+    on BOTH the covariate and the label axis. The fixture must preserve
+    the A < B < C ordering or shift-robust methods cannot be tested.
+    """
+    _, truth = fixture
+    d, f = truth["drives_by_vendor"], truth["failures_by_vendor"]
+    rate = {v: f[v] / d[v] for v in d}
+    assert rate["A"] < rate["B"] < rate["C"]
+    assert rate["C"] / rate["A"] > 2.0
+
+
+# ---------------------------------------------------------------
+# Common-16 feature policy
+# ---------------------------------------------------------------
+
+def test_common_columns_are_sixteen():
+    assert len(COMMON_IDS) == 8
+    assert len(COMMON_COLS) == 16
+
+
+def test_common_columns_populated_for_every_vendor(fixture):
+    """
+    LOCKED POLICY: the common-16 are the only features usable in every
+    LOMO fold. Columns exclusive to training vendors are all-NaN at test
+    time; columns exclusive to the held-out vendor were never trained on.
     """
     df, _ = fixture
-    per_vendor = (
-        df.with_columns(pl.col("model").str.slice(1, 1).alias("vendor"))
-        .group_by("vendor")
-        .agg(pl.col("disk_id").n_unique().alias("n"))
-        .sort("n")
-    )
-    assert per_vendor["vendor"][0] == "C"
+    for prefix in ["MA", "MB", "MC"]:
+        sub = df.filter(pl.col("model").str.starts_with(prefix))
+        for c in COMMON_COLS:
+            frac = float((~sub[c].is_nan()).mean())
+            assert frac > 0.9, f"{c} sparse for {prefix}: {frac}"
+
+
+def test_common_columns_are_the_true_intersection(fixture):
+    _, truth = fixture
+    sets = [set(ids) for ids in truth["vendor_smart_ids"].values()]
+    assert set(truth["common_ids"]) == set.intersection(*sets)
+
+
+def test_signal_lives_in_common_columns(fixture):
+    """
+    If the injected signal sat outside the common-16 it would vanish in
+    the folds that matter, and feature-selection tests would be vacuous.
+    """
+    _, truth = fixture
+    assert set(truth["signal_ids"]) <= set(truth["common_ids"])
+
+
+def test_common_columns_differ_in_distribution_across_vendors(fixture):
+    """
+    Structural shift (which columns exist) is not the only shift. The
+    shared columns must also be distributed differently per vendor, or
+    weighted conformal would have nothing to reweight.
+    """
+    df, truth = fixture
+    healthy = df.filter(pl.col("failure_time").is_null())
+    col = f"n_{truth['common_ids'][0]}"
+
+    means = {}
+    for v, prefix in [("A", "MA"), ("B", "MB"), ("C", "MC")]:
+        sub = healthy.filter(pl.col("model").str.starts_with(prefix))
+        means[v] = float(np.nanmean(sub[col].to_numpy()))
+
+    spread = max(means.values()) - min(means.values())
+    assert spread > 1.0, f"no covariate shift in {col}: {means}"
