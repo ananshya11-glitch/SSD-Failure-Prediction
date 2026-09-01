@@ -19,6 +19,8 @@ pipeline, and that the LOMO harness produces a populated results table.
 import numpy as np
 import pytest
 
+from src.conformal import METHODS, METHOD_INPUTS
+from src.conformal.mondrian import group_conditional_coverage
 from src.conformal.split import SplitConformal, coverage_report
 from src.data.labels import build_labels
 from src.data.splits import make_all_lomo_splits, make_standard_split
@@ -69,8 +71,16 @@ class DummyModel:
         return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
 
 
-def run_fold(labelled, split, alpha=0.10, score_fn="lac"):
-    """One fold end to end. Returns the coverage report."""
+def run_fold(labelled, split, alpha=0.10, score_fn="lac", method="split",
+             seed=0):
+    """
+    One fold end to end for one conformal method. Returns the coverage
+    report row.
+
+    Every method receives the same model probabilities. What differs is
+    only how the calibration scores are turned into sets, so differences
+    between rows are attributable to the conformal procedure alone.
+    """
     parts = {}
     for name in ("train", "cal", "test"):
         parts[name] = make_windows(split.apply(labelled, name),
@@ -86,16 +96,29 @@ def run_fold(labelled, split, alpha=0.10, score_fn="lac"):
     Xte, _ = flatten(parts["test"], "last")
 
     model = DummyModel().fit(Xtr, parts["train"].y)
+    p_cal = model.predict_proba(Xca)
+    p_te = model.predict_proba(Xte)
 
-    cp = SplitConformal(alpha=alpha, score_fn=score_fn).fit(
-        model.predict_proba(Xca), parts["cal"].y
-    )
-    result = cp.predict(model.predict_proba(Xte))
+    cp = METHODS[method](alpha, score_fn, seed)
+    needs = METHOD_INPUTS[method]
+
+    if "groups" in needs:
+        cp.fit(p_cal, parts["cal"].y, groups=parts["cal"].vendors)
+        result = cp.predict(p_te, groups=parts["test"].vendors)
+    elif "features" in needs:
+        # Weighted conformal sees test FEATURES only, never test labels.
+        cp.fit_from_features(p_cal, parts["cal"].y, Xca, Xte)
+        result = cp.predict_from_features(p_te, Xte)
+    else:
+        cp.fit(p_cal, parts["cal"].y)
+        result = cp.predict(p_te)
 
     rep = coverage_report(result, parts["test"].y)
     rep["split"] = split.name
     rep["n_train_windows"] = len(parts["train"])
     rep["test_prevalence"] = float(parts["test"].y.mean())
+    if "features" in needs:
+        rep["domain_auc"] = cp.weight_info_["domain_auc"]
     return rep
 
 
@@ -253,6 +276,114 @@ def test_pipeline_is_deterministic(pipeline):
 
 
 # ---------------------------------------------------------------
+# All four conformal methods compose with the pipeline
+# ---------------------------------------------------------------
+
+@pytest.mark.parametrize("method", sorted(METHODS))
+def test_every_method_runs_on_standard_split(pipeline, method):
+    labelled, standard, _ = pipeline
+    rep = run_fold(labelled, standard, method=method)
+    assert rep["method"].startswith(method.split("_")[0])
+    assert 0.0 <= rep["empirical_coverage"] <= 1.0
+    assert rep["n_failures_test"] > 0
+
+
+@pytest.mark.parametrize("method", sorted(METHODS))
+@pytest.mark.parametrize("vendor", ["A", "B", "C"])
+def test_every_method_runs_on_every_lomo_fold(pipeline, method, vendor):
+    labelled, _, lomo = pipeline
+    rep = run_fold(labelled, lomo[vendor], method=method)
+    assert rep["split"] == f"lomo_{vendor}"
+    assert rep["n_test"] > 0
+
+
+def test_mondrian_class_raises_failure_coverage_over_split(pipeline):
+    """
+    The reason Mondrian is required. On the same probabilities, per-class
+    calibration must lift failure-class coverage relative to split
+    conformal, on every fold.
+
+    No per-fold floor is asserted. The guarantee is over repeated
+    calibration draws, and each fold here is ONE draw from ~9 positive
+    calibration drives whose windows are correlated (30 consecutive days
+    of the same drive). Single folds legitimately land at 0.66 or 0.77.
+    That is exactly why per-fold coverage is reported as a case study,
+    not a population estimate. The mean across folds is checked instead.
+    """
+    labelled, standard, lomo = pipeline
+    gains, mond = [], []
+    for sp in [standard, *lomo.values()]:
+        s = run_fold(labelled, sp, method="split")
+        m = run_fold(labelled, sp, method="mondrian_class")
+        assert m["coverage_failure"] > s["coverage_failure"], sp.name
+        gains.append(m["coverage_failure"] - s["coverage_failure"])
+        mond.append(m["coverage_failure"])
+    assert np.mean(mond) >= 0.80, np.mean(mond)
+    assert min(gains) > 0.2
+
+
+def test_mondrian_group_flags_fallback_on_lomo_only(pipeline):
+    """
+    On the standard split every vendor has a calibration cell, so no
+    fallback. On a LOMO fold the held-out vendor has none, so every test
+    point is flagged. This is the contrast the paper reports.
+    """
+    labelled, standard, lomo = pipeline
+    assert run_fold(labelled, standard,
+                    method="mondrian_group")["fallback_rate"] == 0.0
+    for v in "ABC":
+        assert run_fold(labelled, lomo[v],
+                        method="mondrian_group")["fallback_rate"] == 1.0
+
+
+def test_weighted_reports_domain_auc(pipeline):
+    """
+    The domain classifier's AUC measures how separable calibration and
+    test FEATURES are. Under real vendor shift it should be high.
+
+    CAUTION, documented here because it will matter on real data: on the
+    standard split -- exchangeable at drive level -- the AUC is NOT near
+    0.5 on this fixture. With ~64 calibration drives and ~80 test
+    drives, each carrying a drive-specific baseline and ~10 near-
+    identical windows, the domain classifier memorises drive identity.
+    The absolute AUC is therefore inflated by within-drive correlation
+    whenever drive counts are small, and should be read relatively, not
+    as a clean shift magnitude. The real fleet has thousands of drives
+    per fold, which dilutes this, but the effect should be checked there
+    too (compare domain AUC on the standard split against 0.5).
+    """
+    labelled, standard, lomo = pipeline
+    std = run_fold(labelled, standard, method="weighted")["domain_auc"]
+    lomo_auc = {v: run_fold(labelled, lomo[v], method="weighted")
+                ["domain_auc"] for v in "ABC"}
+
+    # Vendors B and C carry the largest synthetic offsets; their LOMO
+    # folds must be more separable than the exchangeable split.
+    assert lomo_auc["B"] > std and lomo_auc["C"] > std, (std, lomo_auc)
+    assert max(lomo_auc.values()) > 0.9
+
+
+def test_weighted_never_sees_test_labels(pipeline, monkeypatch):
+    """
+    Guard against a future refactor passing test labels into weight
+    estimation. The fit path must only consume test features.
+    """
+    import src.conformal.weighted as wmod
+    seen = {}
+    orig = wmod.estimate_density_ratio
+
+    def spy(X_cal, X_test, **kw):
+        seen["shapes"] = (np.asarray(X_cal).shape, np.asarray(X_test).shape)
+        return orig(X_cal, X_test, **kw)
+
+    monkeypatch.setattr(wmod, "estimate_density_ratio", spy)
+    labelled, _, lomo = pipeline
+    run_fold(labelled, lomo["B"], method="weighted")
+    # both arguments are 2-D feature matrices, not label vectors
+    assert all(len(sh) == 2 for sh in seen["shapes"])
+
+
+# ---------------------------------------------------------------
 # Reporting helper — prints the table the paper needs
 # ---------------------------------------------------------------
 
@@ -262,22 +393,28 @@ def test_print_results_table(pipeline, capsys):
     -s to see it.
     """
     labelled, standard, lomo = pipeline
-    rows = [run_fold(labelled, s)
-            for s in [standard, *lomo.values()]]
+    splits = [standard, *lomo.values()]
+    rows = [run_fold(labelled, sp, method=m)
+            for m in sorted(METHODS) for sp in splits]
 
     with capsys.disabled():
         print()
-        print(f"{'split':<10} {'n_test':>7} {'prev':>7} {'cov':>7} "
-              f"{'cov_hlt':>8} {'cov_fail':>9} {'size':>6} {'empty':>7}")
+        print(f"{'method':<15} {'split':<10} {'n_test':>7} {'prev':>6} "
+              f"{'cov':>7} {'cov_hlt':>8} {'cov_fail':>9} {'size':>6} "
+              f"{'fallbk':>7}")
+        last = None
         for r in rows:
-            print(f"{r['split']:<10} {r['n_test']:>7,} "
-                  f"{r['test_prevalence']:>7.4f} "
+            if last is not None and r["method"] != last:
+                print()
+            last = r["method"]
+            print(f"{r['method']:<15} {r['split']:<10} {r['n_test']:>7,} "
+                  f"{r['test_prevalence']:>6.3f} "
                   f"{r['empirical_coverage']:>7.4f} "
                   f"{r['coverage_healthy']:>8.4f} "
                   f"{r['coverage_failure']:>9.4f} "
                   f"{r['avg_set_size']:>6.3f} "
-                  f"{r['empty_rate']:>7.4f}")
+                  f"{r['fallback_rate']:>7.2f}")
         print("\nDummy model on synthetic data. Shape check only — "
               "these are not results.")
 
-    assert len(rows) == 4
+    assert len(rows) == len(METHODS) * 4

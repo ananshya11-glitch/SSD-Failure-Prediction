@@ -60,12 +60,35 @@ def conformal_quantile(scores: np.ndarray, alpha: float) -> float:
 
 @dataclass
 class ConformalResult:
-    """Prediction sets as a boolean (n, 2) mask over [healthy, failure]."""
+    """
+    Prediction sets as a boolean (n, 2) mask over [healthy, failure].
+
+    `qhat` is a scalar for split conformal, a per-class or per-group dict
+    for Mondrian, and a per-test-point array for weighted conformal.
+    `method` names the procedure that produced the sets.
+    `fallback` marks test points where a Mondrian group had no
+    calibration data and a pooled quantile was substituted.
+    """
     sets: np.ndarray
-    qhat: float
+    qhat: object
     alpha: float
     score_fn: str
     n_cal: int
+    method: str = "split"
+    fallback: np.ndarray | None = None
+
+    @property
+    def qhat_scalar(self) -> float:
+        """A single representative threshold, for reporting."""
+        q = self.qhat
+        if isinstance(q, dict):
+            vals = [v for v in q.values() if np.isfinite(v)]
+            return float(np.median(vals)) if vals else float("inf")
+        arr = np.asarray(q, dtype=np.float64).ravel()
+        if arr.size == 1:
+            return float(arr[0])
+        finite = arr[np.isfinite(arr)]
+        return float(np.median(finite)) if finite.size else float("inf")
 
     @property
     def set_sizes(self) -> np.ndarray:
@@ -92,6 +115,33 @@ class ConformalResult:
     def as_labels(self) -> list[list[int]]:
         return [[k for k in (HEALTHY, FAILURE) if row[k]]
                 for row in self.sets]
+
+
+def candidate_scores(probs: np.ndarray, score_fn: str,
+                     seed: int) -> np.ndarray:
+    """(n, 2) candidate-label scores under the named score function."""
+    _, cand_fn = SCORE_FNS[score_fn]
+    if score_fn == "aps":
+        return cand_fn(probs, rng=np.random.default_rng(seed + 1))
+    return cand_fn(probs)
+
+
+def true_scores(probs: np.ndarray, labels: np.ndarray, score_fn: str,
+                seed: int) -> np.ndarray:
+    """(n,) true-label scores under the named score function."""
+    true_fn, _ = SCORE_FNS[score_fn]
+    if score_fn == "aps":
+        return true_fn(probs, labels, rng=np.random.default_rng(seed))
+    return true_fn(probs, labels)
+
+
+def force_nonempty(sets: np.ndarray, cand: np.ndarray) -> np.ndarray:
+    """Put the least-nonconforming label into any empty set."""
+    empty = ~sets.any(axis=1)
+    if empty.any():
+        best = np.argmin(cand[empty], axis=1)
+        sets[np.flatnonzero(empty), best] = True
+    return sets
 
 
 class SplitConformal:
@@ -123,13 +173,8 @@ class SplitConformal:
 
     def fit(self, cal_probs: np.ndarray,
             cal_labels: np.ndarray) -> "SplitConformal":
-        true_fn, _ = SCORE_FNS[self.score_fn]
-        if self.score_fn == "aps":
-            scores = true_fn(cal_probs, cal_labels,
-                             rng=np.random.default_rng(self.seed))
-        else:
-            scores = true_fn(cal_probs, cal_labels)
-
+        scores = true_scores(cal_probs, cal_labels, self.score_fn,
+                             self.seed)
         self.qhat_ = conformal_quantile(scores, self.alpha)
         self.n_cal_ = len(np.asarray(cal_probs).ravel())
         return self
@@ -138,22 +183,15 @@ class SplitConformal:
         if self.qhat_ is None:
             raise RuntimeError("call fit() before predict()")
 
-        _, cand_fn = SCORE_FNS[self.score_fn]
-        if self.score_fn == "aps":
-            cand = cand_fn(probs, rng=np.random.default_rng(self.seed + 1))
-        else:
-            cand = cand_fn(probs)
+        cand = candidate_scores(probs, self.score_fn, self.seed)
         sets = cand <= self.qhat_
 
         if not self.allow_empty:
-            # Force the argmax label into any empty set. Conservative:
-            # coverage can only increase. An empty set is theoretically
-            # meaningful (both labels are surprising) but not actionable
-            # for an operator deciding whether to replace a drive.
-            empty = ~sets.any(axis=1)
-            if empty.any():
-                best = np.argmin(cand[empty], axis=1)
-                sets[np.flatnonzero(empty), best] = True
+            # Conservative: coverage can only increase. An empty set is
+            # theoretically meaningful (both labels surprising) but not
+            # actionable for an operator deciding whether to replace a
+            # drive.
+            sets = force_nonempty(sets, cand)
 
         return ConformalResult(
             sets=sets,
@@ -161,6 +199,7 @@ class SplitConformal:
             alpha=self.alpha,
             score_fn=self.score_fn,
             n_cal=self.n_cal_,
+            method="split",
         )
 
 
@@ -208,9 +247,12 @@ def coverage_report(result: ConformalResult,
         "singleton_rate": float(result.is_singleton.mean()),
         "doubleton_rate": float(result.is_doubleton.mean()),
         "empty_rate": float(result.is_empty.mean()),
-        "qhat": result.qhat,
+        "qhat": result.qhat_scalar,
         "n_cal": result.n_cal,
         "n_test": int(len(labels)),
         "n_failures_test": int((labels == FAILURE).sum()),
         "score_fn": result.score_fn,
+        "method": result.method,
+        "fallback_rate": (float(result.fallback.mean())
+                          if result.fallback is not None else 0.0),
     }
