@@ -907,6 +907,17 @@ MAIN_COLS = [
     "win_auc",
 ]
 
+    return (
+        df
+        .select(cols)
+        .sort(
+            [
+                "model",
+                "conformal",
+                "split",
+            ]
+        )
+    )
 
 def results_table(
     df: pl.DataFrame,

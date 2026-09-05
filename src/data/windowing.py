@@ -555,7 +555,7 @@ def make_windows(
 @dataclass
 class Normalizer:
     """
-    Per-feature standardisation, fit on training windows only.
+    Feature scaling, fit on training windows only.
 
     Fitting on pooled data leaks test information into both the model
     and the conformal calibration scores.
@@ -564,7 +564,13 @@ class Normalizer:
     mean: np.ndarray
     std: np.ndarray
     features: list[str]
+    method: str = "zscore"
+    # rank mode: group -> (n_features, n_grid) sorted training values
+    grids: dict | None = None
+    pooled_grid: np.ndarray | None = None
+    n_grid: int = 1000
 
+    # -----------------------------------------------------------
     @classmethod
     def fit(
         cls,
@@ -629,6 +635,59 @@ class Normalizer:
             stride=ws.stride,
             positive_stride=ws.positive_stride,
         )
+
+    def _rank_transform(self, ws, groups):
+        g = groups if groups is not None else ws.vendors
+        g = np.asarray(g)
+        n, w, f = ws.X.shape
+        out = np.empty_like(ws.X, dtype=np.float64)
+
+        for key in np.unique(g):
+            idx = np.flatnonzero(g == key)
+            # An unseen group has no training grid -- fall back to the
+            # pooled one. Under LOMO the held-out vendor is always
+            # unseen, so this is the normal path for the test set and
+            # is exactly the deployment situation: a new manufacturer
+            # arrives and you have no history for it.
+            grid = self.grids.get(key, self.pooled_grid)
+            block = ws.X[idx].reshape(-1, f)
+            ranked = np.empty_like(block, dtype=np.float64)
+            for j in range(f):
+                pos = np.searchsorted(grid[j], block[:, j], side="left")
+                ranked[:, j] = pos / max(len(grid[j]) - 1, 1)
+            out[idx] = ranked.reshape(len(idx), w, f)
+
+        return out - 0.5          # centre on zero
+
+
+def constant_features(ws: WindowSet, eps: float = 1e-6) -> list[str]:
+    """
+    Features with (near) zero variance in this window set.
+
+    On the real fleet, holding out vendor A, SEVEN of the sixteen shared
+    SMART columns are constant for vendor A: n_9, n_12, n_184, n_187,
+    n_197, n_199 and r_187, with r_184 near-constant at std 0.02.
+
+    A feature the model split on during training but which never varies
+    at test time contributes nothing but the leaf value it happened to
+    land in. Dropping them is both a modelling fix and a reportable
+    finding about how little the "shared" attributes actually share.
+    """
+    flat = ws.X.reshape(-1, ws.X.shape[-1])
+    std = flat.std(axis=0)
+    return [f for f, s in zip(ws.features, std) if s < eps]
+
+
+def drop_features(ws: WindowSet, drop: list[str]) -> WindowSet:
+    """Return a copy of `ws` without the named features."""
+    keep = [f for f in ws.features if f not in set(drop)]
+    idx = [ws.features.index(f) for f in keep]
+    return WindowSet(
+        X=ws.X[:, :, idx], y=ws.y, drive_idx=ws.drive_idx,
+        end_ds=ws.end_ds, drives=ws.drives, vendors=ws.vendors,
+        features=keep, window_len=ws.window_len, stride=ws.stride,
+        positive_stride=ws.positive_stride,
+    )
 
 
 # ---------------------------------------------------------------
