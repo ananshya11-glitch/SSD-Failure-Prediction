@@ -1,0 +1,2 @@
+split,aggregation,n_cal_drives,n_cal_failed_drives,n_test_drives,n_test_failed_drives,test_prevalence,roc_auc,pr_auc,precision,recall,qhat_lac,coverage_lac,coverage_healthy_lac,coverage_failure_lac,avg_set_size_lac,singleton_rate_lac,doubleton_rate_lac,empty_rate_lac
+standard,mean_final_30_windows,3108,78,3884,112,0.028836251287332648,0.6875958661566429,0.1244773473557182,0.04329524954900782,0.6428571428571429,0.8108902116616566,0.9768280123583934,0.9840933191940615,0.7321428571428571,1.8905767250257466,0.10942327497425335,0.8905767250257467,0.0

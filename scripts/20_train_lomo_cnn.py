@@ -1,8 +1,8 @@
 from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
@@ -11,57 +11,104 @@ from sklearn.metrics import (
     f1_score,
 )
 
+
 # ============================================================
 # CONFIG
 # ============================================================
 
-WINDOW_ROOT = Path("data/processed/lomo/windows")
-RESULTS = Path("results/lomo")
+WINDOW_ROOT = Path(
+    "data/processed/lomo/windows"
+)
+
+RESULT_ROOT = Path(
+    "results/lomo"
+)
+
+LOMO_FOLDS = ["A", "B", "C"]
 
 BATCH_SIZE = 4096
 EPOCHS = 5
 LEARNING_RATE = 1e-3
 
-DEVICE = torch.device("cpu")
+SEED = 42
 
-LOMO_CONFIG = {
-    "A": ("train", "calibration", "test"),
-    "B": ("train", "calibration", "test"),
-    "C": ("train", "calibration", "test"),
-}
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 
 # ============================================================
-# CNN
+# DEVICE
+# ============================================================
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print(f"Device: {DEVICE}")
+
+
+# ============================================================
+# MODEL
 # ============================================================
 
 class CNN1D(nn.Module):
 
-    def __init__(self, n_features=16):
+    def __init__(self, n_features):
+
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv1d(n_features, 32, kernel_size=3, padding=1),
+
+            nn.Conv1d(
+                in_channels=n_features,
+                out_channels=32,
+                kernel_size=3,
+                padding=1,
+            ),
+
             nn.ReLU(),
 
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+
+            nn.Conv1d(
+                in_channels=32,
+                out_channels=64,
+                kernel_size=3,
+                padding=1,
+            ),
+
             nn.ReLU(),
+
+            nn.BatchNorm1d(64),
 
             nn.AdaptiveAvgPool1d(1),
         )
 
         self.classifier = nn.Sequential(
+
             nn.Flatten(),
+
             nn.Linear(64, 32),
+
             nn.ReLU(),
+
             nn.Dropout(0.3),
+
             nn.Linear(32, 1),
         )
 
     def forward(self, x):
-        # x = batch × time × features
+
+        # Input:
+        # (batch, 30, features)
+
+        # Conv1d expects:
+        # (batch, features, 30)
+
         x = x.transpose(1, 2)
+
         x = self.features(x)
+
         return self.classifier(x).squeeze(1)
 
 
@@ -71,108 +118,317 @@ class CNN1D(nn.Module):
 
 def load_split(lomo, split):
 
-    path = WINDOW_ROOT / f"lomo_{lomo}" / split
+    split_dir = (
+        WINDOW_ROOT
+        / f"lomo_{lomo}"
+        / split
+    )
 
-    X = np.load(path / "X.npy", mmap_mode="r")
-    y = np.load(path / "y.npy")
+    X_path = split_dir / "X.npy"
+    y_path = split_dir / "y.npy"
+
+    if not X_path.exists():
+        raise FileNotFoundError(
+            f"Missing X file:\n{X_path}"
+        )
+
+    if not y_path.exists():
+        raise FileNotFoundError(
+            f"Missing y file:\n{y_path}"
+        )
+
+    # mmap keeps the huge arrays from being unnecessarily
+    # copied into memory.
+    X = np.load(
+        X_path,
+        mmap_mode="r",
+    )
+
+    y = np.load(y_path)
+
+    if X.ndim != 3:
+        raise ValueError(
+            f"{X_path} has shape {X.shape}; "
+            f"expected 3 dimensions."
+        )
+
+    if X.shape[0] != len(y):
+        raise ValueError(
+            f"X/y mismatch for {lomo}/{split}: "
+            f"{X.shape[0]} vs {len(y)}"
+        )
+
+    if X.shape[1] != 30:
+        raise ValueError(
+            f"Expected window length 30, "
+            f"got {X.shape[1]}"
+        )
 
     return X, y
+
+
+# ============================================================
+# CREATE DATA LOADER
+# ============================================================
+
+class NumpyDataset(torch.utils.data.Dataset):
+
+    def __init__(self, X, y):
+
+        self.X = X
+        self.y = y
+
+    def __len__(self):
+
+        return len(self.y)
+
+    def __getitem__(self, idx):
+
+        # .copy() avoids the non-writable NumPy warning.
+        x = np.array(
+            self.X[idx],
+            dtype=np.float32,
+            copy=True,
+        )
+
+        y = np.float32(
+            self.y[idx]
+        )
+
+        return (
+            torch.from_numpy(x),
+            torch.tensor(y),
+        )
 
 
 # ============================================================
 # EVALUATION
 # ============================================================
 
-def evaluate(model, X, y):
+@torch.no_grad()
+def predict(model, X, batch_size):
 
     model.eval()
 
     probabilities = []
 
-    loader = DataLoader(
-        TensorDataset(
-            torch.from_numpy(np.asarray(X)),
-        ),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
+    n = len(X)
+
+    for start in range(
+        0,
+        n,
+        batch_size,
+    ):
+
+        end = min(
+            start + batch_size,
+            n,
+        )
+
+        batch = np.array(
+            X[start:end],
+            dtype=np.float32,
+            copy=True,
+        )
+
+        batch = torch.from_numpy(
+            batch
+        ).to(DEVICE)
+
+        logits = model(batch)
+
+        probs = torch.sigmoid(
+            logits
+        )
+
+        probabilities.append(
+            probs.cpu().numpy()
+        )
+
+    return np.concatenate(
+        probabilities
     )
-
-    with torch.no_grad():
-
-        for (batch,) in loader:
-
-            batch = batch.float().to(DEVICE)
-
-            logits = model(batch)
-
-            probs = torch.sigmoid(logits)
-
-            probabilities.append(
-                probs.cpu().numpy()
-            )
-
-    probabilities = np.concatenate(probabilities)
-
-    roc = roc_auc_score(y, probabilities)
-    pr = average_precision_score(y, probabilities)
-
-    predictions = (probabilities >= 0.5).astype(np.int8)
-
-    precision = precision_score(
-        y, predictions, zero_division=0
-    )
-
-    recall = recall_score(
-        y, predictions, zero_division=0
-    )
-
-    f1 = f1_score(
-        y, predictions, zero_division=0
-    )
-
-    return probabilities, roc, pr, precision, recall, f1
 
 
 # ============================================================
-# TRAIN ONE LOMO MODEL
+# METRICS
+# ============================================================
+
+def calculate_metrics(
+    y_true,
+    probabilities,
+):
+
+    predictions = (
+        probabilities >= 0.5
+    ).astype(np.int8)
+
+    roc_auc = roc_auc_score(
+        y_true,
+        probabilities,
+    )
+
+    pr_auc = average_precision_score(
+        y_true,
+        probabilities,
+    )
+
+    precision = precision_score(
+        y_true,
+        predictions,
+        zero_division=0,
+    )
+
+    recall = recall_score(
+        y_true,
+        predictions,
+        zero_division=0,
+    )
+
+    f1 = f1_score(
+        y_true,
+        predictions,
+        zero_division=0,
+    )
+
+    return {
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+# ============================================================
+# TRAIN ONE LOMO FOLD
 # ============================================================
 
 def train_lomo(lomo):
 
-    print("\n" + "=" * 70)
+    print()
+    print("=" * 70)
     print(f"LOMO-{lomo}")
     print("=" * 70)
 
-    X_train, y_train = load_split(lomo, "train")
-    X_cal, y_cal = load_split(lomo, "calibration")
-    X_test, y_test = load_split(lomo, "test")
+    # --------------------------------------------------------
+    # Load data
+    # --------------------------------------------------------
 
-    print(f"Train: {X_train.shape}")
-    print(f"Calibration: {X_cal.shape}")
-    print(f"Test: {X_test.shape}")
-
-    positives = int(y_train.sum())
-    negatives = int((y_train == 0).sum())
-
-    pos_weight = negatives / positives
-
-    print(f"Training positives: {positives:,}")
-    print(f"Training negatives: {negatives:,}")
-    print(f"Positive weight: {pos_weight:.2f}")
-
-    dataset = TensorDataset(
-        torch.from_numpy(np.asarray(X_train)),
-        torch.from_numpy(y_train.astype(np.float32)),
+    X_train, y_train = load_split(
+        lomo,
+        "train",
     )
 
-    loader = DataLoader(
-        dataset,
+    X_cal, y_cal = load_split(
+        lomo,
+        "calibration",
+    )
+
+    X_test, y_test = load_split(
+        lomo,
+        "test",
+    )
+
+    print(
+        f"Train: {X_train.shape}"
+    )
+
+    print(
+        f"Calibration: {X_cal.shape}"
+    )
+
+    print(
+        f"Test: {X_test.shape}"
+    )
+
+    # --------------------------------------------------------
+    # Determine number of features directly from data.
+    #
+    # This is IMPORTANT.
+    #
+    # We do NOT hard-code 15 or 16 here.
+    # --------------------------------------------------------
+
+    n_features = X_train.shape[2]
+
+    if X_cal.shape[2] != n_features:
+        raise ValueError(
+            "Train/calibration feature mismatch: "
+            f"{n_features} vs {X_cal.shape[2]}"
+        )
+
+    if X_test.shape[2] != n_features:
+        raise ValueError(
+            "Train/test feature mismatch: "
+            f"{n_features} vs {X_test.shape[2]}"
+        )
+
+    print(
+        f"Features: {n_features}"
+    )
+
+    # --------------------------------------------------------
+    # Class balance
+    # --------------------------------------------------------
+
+    positives = int(
+        (y_train == 1).sum()
+    )
+
+    negatives = int(
+        (y_train == 0).sum()
+    )
+
+    if positives == 0:
+        raise ValueError(
+            f"LOMO-{lomo} training set "
+            "contains no positive samples."
+        )
+
+    pos_weight = (
+        negatives / positives
+    )
+
+    print(
+        f"Training positives: "
+        f"{positives:,}"
+    )
+
+    print(
+        f"Training negatives: "
+        f"{negatives:,}"
+    )
+
+    print(
+        f"Positive weight: "
+        f"{pos_weight:.2f}"
+    )
+
+    # --------------------------------------------------------
+    # Dataset / DataLoader
+    # --------------------------------------------------------
+
+    train_dataset = NumpyDataset(
+        X_train,
+        y_train,
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=0,
+        pin_memory=False,
     )
 
-    model = CNN1D().to(DEVICE)
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
+
+    model = CNN1D(
+        n_features=n_features
+    ).to(DEVICE)
 
     criterion = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(
@@ -187,154 +443,325 @@ def train_lomo(lomo):
         lr=LEARNING_RATE,
     )
 
-    best_pr = -1
+    # --------------------------------------------------------
+    # Best model selected by calibration PR-AUC.
+    # --------------------------------------------------------
 
-    RESULTS.mkdir(parents=True, exist_ok=True)
+    best_pr_auc = -np.inf
 
-    model_path = RESULTS / f"lomo_{lomo}_best.pt"
+    best_state = None
 
-    # ========================================================
-    # EPOCHS
-    # ========================================================
+    # --------------------------------------------------------
+    # Training
+    # --------------------------------------------------------
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(
+        1,
+        EPOCHS + 1,
+    ):
 
         model.train()
 
         total_loss = 0.0
-        batches = 0
 
-        for X_batch, y_batch in loader:
+        total_samples = 0
 
-            X_batch = X_batch.float().to(DEVICE)
-            y_batch = y_batch.to(DEVICE)
+        for X_batch, y_batch in train_loader:
 
-            optimizer.zero_grad()
+            X_batch = X_batch.to(
+                DEVICE,
+                non_blocking=True,
+            )
 
-            logits = model(X_batch)
+            y_batch = y_batch.to(
+                DEVICE,
+                non_blocking=True,
+            )
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            logits = model(
+                X_batch
+            )
 
             loss = criterion(
                 logits,
-                y_batch
+                y_batch,
             )
 
             loss.backward()
+
             optimizer.step()
 
-            total_loss += loss.item()
-            batches += 1
+            batch_size = (
+                y_batch.shape[0]
+            )
 
-        avg_loss = total_loss / batches
+            total_loss += (
+                loss.item()
+                * batch_size
+            )
 
-        (
-            cal_probs,
-            cal_roc,
-            cal_pr,
-            cal_precision,
-            cal_recall,
-            cal_f1,
-        ) = evaluate(
+            total_samples += (
+                batch_size
+            )
+
+        average_loss = (
+            total_loss
+            / total_samples
+        )
+
+        # ----------------------------------------------------
+        # Calibration evaluation
+        # ----------------------------------------------------
+
+        cal_probs = predict(
             model,
             X_cal,
-            y_cal
+            BATCH_SIZE,
+        )
+
+        cal_metrics = calculate_metrics(
+            y_cal,
+            cal_probs,
         )
 
         print(
-            f"\nEpoch {epoch}/{EPOCHS}"
+            f"Epoch {epoch}/{EPOCHS} | "
+            f"loss {average_loss:.6f} | "
+            f"cal ROC-AUC "
+            f"{cal_metrics['roc_auc']:.4f} | "
+            f"cal PR-AUC "
+            f"{cal_metrics['pr_auc']:.4f} | "
+            f"precision "
+            f"{cal_metrics['precision']:.4f} | "
+            f"recall "
+            f"{cal_metrics['recall']:.4f} | "
+            f"F1 "
+            f"{cal_metrics['f1']:.4f}"
         )
 
-        print(
-            f"Loss: {avg_loss:.4f}"
-        )
+        # ----------------------------------------------------
+        # Save best model.
+        # ----------------------------------------------------
 
-        print(
-            f"Calibration ROC-AUC: {cal_roc:.4f}"
-        )
+        if (
+            cal_metrics["pr_auc"]
+            > best_pr_auc
+        ):
 
-        print(
-            f"Calibration PR-AUC: {cal_pr:.4f}"
-        )
-
-        print(
-            f"Precision: {cal_precision:.4f} | "
-            f"Recall: {cal_recall:.4f} | "
-            f"F1: {cal_f1:.4f}"
-        )
-
-        # Save best checkpoint based on calibration PR-AUC
-        if cal_pr > best_pr:
-
-            best_pr = cal_pr
-
-            torch.save(
-                model.state_dict(),
-                model_path
+            best_pr_auc = (
+                cal_metrics["pr_auc"]
             )
 
-            np.save(
-                RESULTS /
-                f"lomo_{lomo}_calibration_probs.npy",
-                cal_probs
+            best_state = {
+                key: value.detach()
+                .cpu()
+                .clone()
+                for key, value
+                in model.state_dict().items()
+            }
+
+            print(
+                f"  -> New best "
+                f"calibration PR-AUC: "
+                f"{best_pr_auc:.4f}"
             )
 
-            np.save(
-                RESULTS /
-                f"lomo_{lomo}_calibration_labels.npy",
-                y_cal
-            )
+    # --------------------------------------------------------
+    # Restore best model.
+    # --------------------------------------------------------
 
-            print("Saved BEST model.")
-
-    # ========================================================
-    # TEST USING BEST MODEL
-    # ========================================================
-
-    print("\nLoading best model...")
+    if best_state is None:
+        raise RuntimeError(
+            "No best model was saved."
+        )
 
     model.load_state_dict(
-        torch.load(
-            model_path,
-            map_location=DEVICE
-        )
+        best_state
     )
 
-    (
-        test_probs,
-        test_roc,
-        test_pr,
-        test_precision,
-        test_recall,
-        test_f1,
-    ) = evaluate(
+    # --------------------------------------------------------
+    # Final calibration probabilities
+    # --------------------------------------------------------
+
+    cal_probs = predict(
+        model,
+        X_cal,
+        BATCH_SIZE,
+    )
+
+    cal_metrics = calculate_metrics(
+        y_cal,
+        cal_probs,
+    )
+
+    # --------------------------------------------------------
+    # Final test probabilities
+    # --------------------------------------------------------
+
+    test_probs = predict(
         model,
         X_test,
-        y_test
+        BATCH_SIZE,
     )
 
-    np.save(
-        RESULTS /
-        f"lomo_{lomo}_test_probs.npy",
-        test_probs
+    test_metrics = calculate_metrics(
+        y_test,
+        test_probs,
     )
 
-    np.save(
-        RESULTS /
-        f"lomo_{lomo}_test_labels.npy",
-        y_test
+    # ========================================================
+    # PRINT FINAL RESULTS
+    # ========================================================
+
+    print()
+    print(
+        "-" * 70
     )
-
-    print("\n" + "-" * 50)
-    print(f"FINAL LOMO-{lomo} TEST RESULTS")
-    print("-" * 50)
-
-    print(f"ROC-AUC : {test_roc:.4f}")
-    print(f"PR-AUC  : {test_pr:.4f}")
-    print(f"Precision: {test_precision:.4f}")
-    print(f"Recall   : {test_recall:.4f}")
-    print(f"F1       : {test_f1:.4f}")
 
     print(
-        f"\nSaved model: {model_path}"
+        f"LOMO-{lomo} FINAL "
+        "CALIBRATION"
+    )
+
+    print(
+        f"ROC-AUC   : "
+        f"{cal_metrics['roc_auc']:.4f}"
+    )
+
+    print(
+        f"PR-AUC    : "
+        f"{cal_metrics['pr_auc']:.4f}"
+    )
+
+    print(
+        f"Precision : "
+        f"{cal_metrics['precision']:.4f}"
+    )
+
+    print(
+        f"Recall    : "
+        f"{cal_metrics['recall']:.4f}"
+    )
+
+    print(
+        f"F1        : "
+        f"{cal_metrics['f1']:.4f}"
+    )
+
+    print()
+    print(
+        f"LOMO-{lomo} FINAL TEST"
+    )
+
+    print(
+        f"ROC-AUC   : "
+        f"{test_metrics['roc_auc']:.4f}"
+    )
+
+    print(
+        f"PR-AUC    : "
+        f"{test_metrics['pr_auc']:.4f}"
+    )
+
+    print(
+        f"Precision : "
+        f"{test_metrics['precision']:.4f}"
+    )
+
+    print(
+        f"Recall    : "
+        f"{test_metrics['recall']:.4f}"
+    )
+
+    print(
+        f"F1        : "
+        f"{test_metrics['f1']:.4f}"
+    )
+
+    # ========================================================
+    # SAVE RESULTS
+    # ========================================================
+
+    RESULT_ROOT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    model_path = (
+        RESULT_ROOT
+        / f"lomo_{lomo}_cnn_best.pt"
+    )
+
+    cal_probs_path = (
+        RESULT_ROOT
+        / f"lomo_{lomo}_calibration_probs.npy"
+    )
+
+    cal_labels_path = (
+        RESULT_ROOT
+        / f"lomo_{lomo}_calibration_labels.npy"
+    )
+
+    test_probs_path = (
+        RESULT_ROOT
+        / f"lomo_{lomo}_test_probs.npy"
+    )
+
+    test_labels_path = (
+        RESULT_ROOT
+        / f"lomo_{lomo}_test_labels.npy"
+    )
+
+    torch.save(
+        model.state_dict(),
+        model_path,
+    )
+
+    np.save(
+        cal_probs_path,
+        cal_probs,
+    )
+
+    np.save(
+        cal_labels_path,
+        y_cal,
+    )
+
+    np.save(
+        test_probs_path,
+        test_probs,
+    )
+
+    np.save(
+        test_labels_path,
+        y_test,
+    )
+
+    print()
+    print("Saved:")
+
+    print(
+        f"  {model_path}"
+    )
+
+    print(
+        f"  {cal_probs_path}"
+    )
+
+    print(
+        f"  {cal_labels_path}"
+    )
+
+    print(
+        f"  {test_probs_path}"
+    )
+
+    print(
+        f"  {test_labels_path}"
     )
 
 
@@ -344,12 +771,11 @@ def train_lomo(lomo):
 
 if __name__ == "__main__":
 
-    print("Device:", DEVICE)
-
-    for lomo in ["A", "B", "C"]:
+    for lomo in LOMO_FOLDS:
 
         train_lomo(lomo)
 
-    print("\n" + "=" * 70)
+    print()
+    print("=" * 70)
     print("ALL LOMO CNN EXPERIMENTS COMPLETE")
     print("=" * 70)
