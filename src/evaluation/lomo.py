@@ -51,8 +51,6 @@ from ..data.splits import (
 )
 from ..data.windowing import (
     Normalizer,
-    constant_features,
-    drop_features,
     flatten,
     make_windows,
 )
@@ -82,21 +80,6 @@ class RunConfig:
     feature_selection: bool = True
     max_features: int | None = None
     seed: int = CFG.seed
-
-    # Feature scaling. "rank" maps each value to its percentile within
-    # its own vendor, removing the wholesale score shift that z-scoring
-    # leaves when a held-out vendor's raw values sit outside the
-    # training range. On the real fleet, z-scoring produced 84% empty
-    # prediction sets on lomo_A because calibration scores clustered at
-    # median 0.049 while vendor A's clustered at 0.195, and the
-    # threshold calibrated on B+C (qhat 0.181) rejected both labels.
-    normalize: str = "zscore"
-
-    # Drop features with zero variance in the TEST split before fitting.
-    # Seven of the sixteen shared SMART columns are constant for vendor
-    # A. A feature the model split on during training but which never
-    # varies at test time contributes only the leaf value it landed in.
-    drop_constant_test_features: bool = False
 
     models: tuple = ("random_forest",)
 
@@ -131,7 +114,6 @@ class FoldData:
 
     selection: object = None
     normalizer: object = None
-    dropped_constant: list = field(default_factory=list)
 
     timings: dict = field(
         default_factory=dict
@@ -299,57 +281,14 @@ def prepare_fold(
     # TRAINING DATA ONLY.
     # ============================================================
 
-    # Statistics come from TRAINING windows only. Under cfg.normalize
-    # == "rank" the quantile grid is built per vendor; the held-out
-    # vendor has no grid by construction and falls back to the pooled
-    # training grid, which is exactly the deployment situation -- a new
-    # manufacturer arrives and there is no history for it.
     norm = Normalizer.fit(
-        parts["train"],
-        method=cfg.normalize,
+        parts["train"]
     )
 
     parts = {
         k: norm.transform(v)
         for k, v in parts.items()
     }
-
-    # ============================================================
-    # 5b. CONSTANT-FEATURE CHECK
-    #
-    # A feature with zero variance in the test split contributes only
-    # the leaf value the model happened to land in. Seven of the
-    # sixteen shared SMART columns are constant for vendor A on the
-    # real fleet, so this is reported whether or not it is acted on.
-    # ============================================================
-
-    dead = constant_features(parts["test"])
-    if dead:
-        print(
-            f"  NOTE: {len(dead)} feature(s) constant in "
-            f"{split.name} test: {dead}"
-        )
-
-    dropped_constant = []
-    if cfg.drop_constant_test_features and dead:
-        # Never drop everything -- a fold with no features left cannot
-        # be evaluated, and an empty result is less useful than a bad
-        # one.
-        if len(dead) < len(parts["test"].features):
-            dropped_constant = list(dead)
-            parts = {
-                k: drop_features(v, dead)
-                for k, v in parts.items()
-            }
-            print(
-                f"  dropped {len(dead)} constant feature(s); "
-                f"{len(parts['train'].features)} remain"
-            )
-        else:
-            print(
-                "  WARNING: every feature is constant in test; "
-                "keeping all"
-            )
 
     # ============================================================
     # 6. FEATURE SELECTION
@@ -430,7 +369,6 @@ def prepare_fold(
         features=features,
         selection=sel,
         normalizer=norm,
-        dropped_constant=dropped_constant,
         timings={
             "window_s": t_win,
             "select_s": t_sel,
@@ -707,16 +645,6 @@ def run_cell(
                 fold.features
             ),
 
-            "normalize": cfg.normalize,
-
-            "n_dropped_constant": len(
-                fold.dropped_constant
-            ),
-
-            "dropped_constant": ",".join(
-                fold.dropped_constant
-            ),
-
             "fit_seconds": round(
                 t_fit,
                 2,
@@ -979,6 +907,17 @@ MAIN_COLS = [
     "win_auc",
 ]
 
+    return (
+        df
+        .select(cols)
+        .sort(
+            [
+                "model",
+                "conformal",
+                "split",
+            ]
+        )
+    )
 
 def results_table(
     df: pl.DataFrame,

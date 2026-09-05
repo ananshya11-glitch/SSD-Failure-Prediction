@@ -559,50 +559,6 @@ class Normalizer:
 
     Fitting on pooled data leaks test information into both the model
     and the conformal calibration scores.
-
-    TWO METHODS
-
-    "zscore" (default)
-        Subtract the training mean, divide by the training standard
-        deviation. Correct when calibration and test come from the same
-        population.
-
-    "rank"
-        Map each value to its percentile WITHIN THE GROUP IT BELONGS TO
-        (vendor, by default), then centre on 0.5. Fit stores the
-        training quantile grid per feature per group; unseen groups fall
-        back to the pooled training grid.
-
-    WHY "rank" EXISTS
-
-    Measured on the real fleet, holding out vendor A:
-
-        feature   train_mean   test_mean   test_std   out_of_range
-        r_9         0.08        3.49        1.16        0.268
-        n_183      -0.99       -2.04        2.20        0.186
-        r_12       -0.01        0.64       15.74        0.002
-        r_199       0.00        1.05       44.06        0.001
-
-    r_9 is power-on-hours. Vendor A's drives sit 3.5 training standard
-    deviations older, with 27% outside the training range entirely.
-    r_12 and r_199 are raw counters whose spread differs by more than an
-    order of magnitude between vendors.
-
-    Under z-scoring, a Random Forest trained on B+C returns the nearest
-    leaf for out-of-range inputs, so vendor A's scores shift wholesale:
-    calibration scores clustered at median 0.049 while vendor A's
-    clustered at 0.195. The conformal threshold calibrated on B+C
-    (qhat = 0.181) then rejected BOTH labels for most vendor-A drives,
-    producing 84% empty prediction sets -- a mechanical failure that
-    looks like a distribution-shift result but is not one.
-
-    Rank normalisation asks "is this drive's power-on-hours high FOR ITS
-    VENDOR", which is the question an operator onboarding a new
-    manufacturer would actually ask. It also removes the counter-scaling
-    problem, since percentiles are scale-free.
-
-    This is a preprocessing choice that must be stated in the paper,
-    not hidden. Report results under both methods.
     """
 
     mean: np.ndarray
@@ -616,56 +572,59 @@ class Normalizer:
 
     # -----------------------------------------------------------
     @classmethod
-    def fit(cls, ws: WindowSet, method: str = "zscore",
-            groups: np.ndarray | None = None, eps: float = 1e-8,
-            n_grid: int = 1000) -> "Normalizer":
-        """
-        `groups` defaults to ws.vendors for method="rank". Pass an
-        explicit array to group by something else (drive model, say).
-        """
-        if method not in ("zscore", "rank"):
-            raise ValueError(f"method must be zscore|rank, got {method!r}")
+    def fit(
+        cls,
+        ws: WindowSet,
+        eps: float = 1e-8,
+    ) -> "Normalizer":
 
-        flat = ws.X.reshape(-1, ws.X.shape[-1])
-        mean = flat.mean(axis=0)
-        std = flat.std(axis=0)
-        std[std < eps] = 1.0
+        flat = ws.X.reshape(
+            -1,
+            ws.X.shape[-1],
+        )
 
-        grids, pooled = None, None
-        if method == "rank":
-            g = groups if groups is not None else ws.vendors
-            # one label per window, expanded to every timestep
-            g_flat = np.repeat(np.asarray(g), ws.X.shape[1])
-            qs = np.linspace(0.0, 1.0, n_grid)
+        mean = flat.mean(
+            axis=0
+        )
 
-            pooled = np.quantile(flat, qs, axis=0).T          # (F, n_grid)
-            grids = {}
-            for key in np.unique(g_flat):
-                sub = flat[g_flat == key]
-                if len(sub) < 2:
-                    grids[key] = pooled
-                else:
-                    grids[key] = np.quantile(sub, qs, axis=0).T
+        std = flat.std(
+            axis=0
+        )
 
-        return cls(mean=mean, std=std, features=list(ws.features),
-                   method=method, grids=grids, pooled_grid=pooled,
-                   n_grid=n_grid)
+        std[
+            std < eps
+        ] = 1.0
 
-    # -----------------------------------------------------------
-    def transform(self, ws: WindowSet,
-                  groups: np.ndarray | None = None) -> WindowSet:
-        if list(ws.features) != list(self.features):
+        return cls(
+            mean=mean,
+            std=std,
+            features=list(
+                ws.features
+            ),
+        )
+
+    def transform(
+        self,
+        ws: WindowSet,
+    ) -> WindowSet:
+
+        if (
+            list(ws.features)
+            != list(self.features)
+        ):
             raise ValueError(
-                "feature mismatch between normalizer and window set"
+                "feature mismatch between "
+                "normalizer and window set"
             )
 
-        if self.method == "zscore":
-            out = (ws.X - self.mean) / self.std
-        else:
-            out = self._rank_transform(ws, groups)
+        out = (
+            ws.X - self.mean
+        ) / self.std
 
         return WindowSet(
-            X=out.astype(np.float32),
+            X=out.astype(
+                np.float32
+            ),
             y=ws.y,
             drive_idx=ws.drive_idx,
             end_ds=ws.end_ds,

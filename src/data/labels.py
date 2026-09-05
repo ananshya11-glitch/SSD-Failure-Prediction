@@ -111,7 +111,16 @@ def build_labels(
     n_drives_in = df.select(DRIVE_KEY).unique().height
 
     out = df.with_columns(vendor_expr())
-
+    # Use calendar days because SMART observations are daily.
+    out = out.with_columns(
+        (
+            pl.col("failure_time").dt.date()
+            - pl.col("ds").dt.date()
+        )
+        .dt.total_days()
+        .cast(pl.Float64)
+        .alias("days_to_failure")
+    )
     # -- 1. post-failure and failure-day rows -------------------
     n_post = 0
     if drop_post_failure:
